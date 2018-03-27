@@ -1,0 +1,155 @@
+# The provider
+provider "aws" {
+    region = "${var.aws_region}"
+}
+
+# Create the VPC
+resource "aws_vpc" "default" {
+    cidr_block = "10.0.0.0/16"
+}
+
+# Create the internet gateway
+resource "aws_internet_gateway" "default" {
+    vpc_id = "${aws_vpc.default.id}"
+}
+
+# Main routing table with internet access
+resource "aws_route" "internet_access" {
+    route_table_id         = "${aws_vpc.default.main_route_table_id}"
+    destination_cidr_block = "0.0.0.0/0"
+    gateway_id             = "${aws_internet_gateway.default.id}"
+}
+
+# Create the app private subnet
+resource "aws_subnet" "app" {
+    vpc_id                  = "${aws_vpc.default.id}"
+    cidr_block              = "10.0.1.0/24"
+    map_public_ip_on_launch = true
+}
+
+# Create SG for ALB
+resource "aws_security_group" "alb" {
+    name        = "app_alb"
+    description = "SG for ALB for application tier."
+    vpc_id      = "${aws_vpc.default.id}"
+
+    # Allow inbound tcp/80
+    ingress {
+        from_port   = 80
+        to_port     = 80
+        protocol    = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+
+    # Allow inbound tcp/443
+    ingress {
+        from_port   = 443
+        to_port     = 443
+        protocol    = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+
+    # Allow outbound everything
+    egress {
+        from_port   = 0
+        to_port     = 0
+        protocol    = "-1"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+}
+
+# Default SG
+resource "aws_security_group" "default" {
+    name        = "[project-environment]"
+    description = "[usage]"
+    vpc_id      = "${aws_vpc.default.id}"
+
+    # Allow SSH access from anywhere - bad idea - change this!
+    ingress {
+        from_port   = 22
+        to_port     = 22
+        protocol    = "tcp"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+
+    # Allow tcp/80 access from within this VPC
+    ingress {
+        from_port   = 80
+        to_port     = 80
+        protocol    = "tcp"
+        cidr_blocks = ["10.0.0.0/16"]
+    }
+    
+    # Allow tcp/443 access from within this VPC
+    ingress {
+        from_port   = 443
+        to_port     = 443
+        protocol    = "tcp"
+        cidr_blocks = ["10.0.0.0/16"]
+    }
+
+    # Allow outbound internet access
+    egress {
+        from_port   = 0
+        to_port     = 0
+        protocol    = "-1"
+        cidr_blocks = ["0.0.0.0/0"]
+    }
+}
+# END default SG
+
+resource "aws_lb" "app" {
+    load_balancer_type         = "application"
+    name                       = "app-alb"
+    internal                   = "${var.load_balancer_is_internal}"
+    subnets                    = ["${aws_subnet.default.id}"]
+    security_groups            = ["${aws_security_group.alb.id}"]
+    enable_deletion_protection = "${var.enable_deletion_protection}"
+    enable_http2               = "${var.enable_http2}"
+    instances                  = ["${aws_instance.web.id}"]
+    listener {
+        instance_port     = 80
+        instance_protocol = "http"
+        lb_port           = 80
+        lb_protocol       = "http"
+    }
+    listener {
+        instance_port     = 80
+        instance_protocol = "http"
+        lb_port           = 443
+        lb_protocol       = "https"
+    }
+}
+
+resource "aws_key_pair" "auth" {
+    key_name   = "${var.key_name}"
+    public_key = "${file(var.public_key_path)}"
+}
+
+resource "aws_instance" "app" {
+    # Use the local SSH agent for authentication
+    connection {
+        # The default username for our AMI
+        user = "centos"
+    }
+    instance_type = "t2.micro"
+
+    # Lookup the correct AMI based on the region
+    ami = "${lookup(var.aws_amis, var.aws_region)}"
+
+    # The name of our SSH keypair created above.
+    key_name = "${aws_key_pair.auth.id}"
+
+    # SG to allow HTTP and SSH access
+    vpc_security_group_ids = ["${aws_security_group.default.id}"]
+
+    # The private subnet in which to launch the instances
+    subnet_id = "${aws_subnet.default.id}"
+
+    # Run a remote provisioner on the instances to update the OS.
+    provisioner "remote-exec" {
+        inline = [
+            "sudo yum update -y"
+        ]
+    }
+}
